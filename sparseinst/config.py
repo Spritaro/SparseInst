@@ -62,6 +62,7 @@ def add_sparse_inst_config(cfg):
     cfg.SOLVER.OPTIMIZER = "ADAMW"
     cfg.SOLVER.BACKBONE_MULTIPLIER = 1.0
     cfg.SOLVER.AMSGRAD = False
+    cfg.SOLVER.GRAD_ACCUM_STEPS = 4
 
     # [Dataset mapper]
     cfg.MODEL.SPARSE_INST.DATASET_MAPPER = "SparseInstDatasetMapper"

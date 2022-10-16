@@ -2,6 +2,7 @@ import os
 import sys
 import itertools
 from typing import Any, Dict, List, Set
+import time
 import torch
 
 import detectron2.utils.comm as comm
@@ -10,6 +11,7 @@ from detectron2.config import get_cfg
 from detectron2.utils.logger import setup_logger
 from detectron2.data import MetadataCatalog, build_detection_train_loader, DatasetMapper
 from detectron2.engine import AutogradProfiler, DefaultTrainer, default_argument_parser, default_setup, launch
+from detectron2.engine.train_loop import AMPTrainer
 from detectron2.evaluation import COCOEvaluator, verify_results
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.evaluation import (
@@ -27,8 +29,51 @@ from detectron2.evaluation import (
 sys.path.append(".")
 from sparseinst import add_sparse_inst_config, COCOMaskEvaluator
 
+def accumulate_gradient_run_step(self):
+    """
+    Very lazy implementation of gradient accumulation with AMP training logic.
+    """
+    assert self.model.training, "[AMPTrainer] model was changed to eval mode!"
+    assert torch.cuda.is_available(), "[AMPTrainer] CUDA is required for AMP training!"
+    from torch.cuda.amp import autocast
+
+    # Create counter if not exist
+    try:
+        self.step_counter
+    except AttributeError:
+        self.grad_accum_steps = 4
+        self.step_counter = 0
+
+    start = time.perf_counter()
+    data = next(self._data_loader_iter)
+    data_time = time.perf_counter() - start
+
+    with autocast():
+        loss_dict = self.model(data)
+        if isinstance(loss_dict, torch.Tensor):
+            losses = loss_dict
+            loss_dict = {"total_loss": loss_dict}
+        else:
+            losses = sum(loss_dict.values())
+        losses = losses / self.grad_accum_steps
+
+    self.grad_scaler.scale(losses).backward()
+
+    self._write_metrics(loss_dict, data_time)
+
+    if (self.step_counter + 1) % self.grad_accum_steps == 0:
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
+        self.optimizer.zero_grad()
+    self.step_counter += 1
+    return
 
 class Trainer(DefaultTrainer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if isinstance(self._trainer, AMPTrainer):
+            self._trainer.run_step = accumulate_gradient_run_step.__get__(self._trainer, AMPTrainer)
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -118,6 +163,40 @@ class Trainer(DefaultTrainer):
                     super().step(closure=closure)
 
             return FullModelGradientClippingOptimizer if enable else optim
+
+        # def add_gradient_accumulation(optim):
+        #     class GradientAccumulatingOptimizer(optim):
+        #         def __init__(self, *args, **kwargs):
+        #             super().__init__(*args, **kwargs)
+        #             self._step_counter = 0
+        #             self._grad_accum_steps = cfg.SOLVER.GRAD_ACCUM_STEPS
+
+        #         def zero_grad(self):
+        #             if self._step_counter % self._grad_accum_steps == 0:
+        #                 super().zero_grad()
+
+        #         def step(self):
+        #             if self._step_counter % self._grad_accum_steps == self._grad_accum_steps - 1:
+        #                 for p in model.parameters():
+        #                     p.grad /= self._grad_accum_steps
+        #                 super().step()
+        #             self._step_counter += 1
+
+        #     return GradientAccumulatingOptimizer
+
+        # optimizer_type = cfg.SOLVER.OPTIMIZER
+        # if optimizer_type == "SGD":
+        #     GradientClippingOptimizer = maybe_add_full_model_gradient_clipping(torch.optim.SGD)
+        #     GradientAccumulatingOptimizer = add_gradient_accumulation(GradientClippingOptimizer)
+        #     optimizer = GradientAccumulatingOptimizer(
+        #         params, cfg.SOLVER.BASE_LR, momentum=cfg.SOLVER.MOMENTUM
+        #     )
+        # elif optimizer_type == "ADAMW":
+        #     GradientClippingOptimizer = maybe_add_full_model_gradient_clipping(torch.optim.AdamW)
+        #     GradientAccumulatingOptimizer = add_gradient_accumulation(GradientClippingOptimizer)
+        #     optimizer = GradientAccumulatingOptimizer(
+        #         params, cfg.SOLVER.BASE_LR, amsgrad=cfg.SOLVER.AMSGRAD
+        #     )
 
         optimizer_type = cfg.SOLVER.OPTIMIZER
         if optimizer_type == "SGD":
